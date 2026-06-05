@@ -1,949 +1,665 @@
 /**
- * CodeWhale-Style Token & Cache Monitor for SillyTavern  v2.0.0
+ * Token & Cache Monitor for SillyTavern  v4.0.0
  * ====================================================================
  *
- * 将 CodeWhale 终端中的 token 统计体验带入 SillyTavern：
- *   - 实时 token 用量（prompt / completion / total）
- *   - DeepSeek 缓存命中/未命中统计 + 命中率可视化
- *   - 成本估算（支持 DeepSeek V4 Pro/Flash/V3 及自定义定价）
- *   - 吞吐量追踪（tokens/秒）
- *   - 缓存效率评分（0-100，颜色编码）
- *   - 会话持久化（localStorage，刷新不丢失）
- *   - 迷你趋势图（最近 20 次请求的 token 变化）
- *   - 成本预估（按当前速率推算）
- *   - STscript 命令：/token-stats, /token-reset, /token-export
- *   - 可拖拽、可折叠浮动面板
+ * v4 architecture — reads ST's internal APIs directly instead of
+ * intercepting network responses.  No more Response.prototype hacks.
  *
- * 安装：将整个文件夹复制到 SillyTavern/public/scripts/extensions/
- *   或在 ST 扩展管理器中粘贴 GitHub 仓库 URL。
+ * Data sources (priority order):
+ *   1. context.generateRawData()          — ST PR #5249+
+ *   2. main_api.lastResponse.usage        — chat completions module
+ *   3. streamingProcessor.lastResponse    — streaming SSE processor
  *
- * 基于 CodeWhale (github.com/usewhale/DeepSeek-Code-Whale) 的
- * token 统计与分析功能设计。
+ * Token counting:
+ *   1. getTokenCountAsync()               — ST's built-in tokenizer
+ *   2. estimateTokensFromText()           — fallback estimator
+ *
+ * Features:
+ *   - Per-message token badges (RikkaHub style)
+ *   - Multi-round tool-call accumulation (DeepSeek/Claude function calling)
+ *   - DeepSeek / Anthropic / OpenAI / Gemini cache detection
+ *   - RMB pricing (¥) with cache-savings calculation
+ *   - Chinese number formatting (万/亿)
+ *   - ST CSS-variable theme integration (auto dark/light)
+ *   - Toggle Σ button — hide panel, click to restore
+ *   - Per-chat independent persistence (localStorage)
+ *   - Mini trend chart, efficiency score, throughput, projected cost
+ *   - Cache-breaker detection, safety timeout
+ *   - STscript commands: /token-stats, /token-reset
+ *   - Touch + mouse drag, double-click collapse
  */
 
+// ── Imports ─────────────────────────────────────────────────────────────
 import {
     eventSource,
     event_types,
     saveSettingsDebounced,
-    extensionSettings,
-    getContext,
 } from '../../../script.js';
+
+import {
+    extension_settings as extSettings,
+    getContext,
+} from '../../extensions.js';
+
+// Optional — available in newer ST builds; degrade gracefully
+let getTokenCountAsync = null;
+let getGeneratingModel = null;
+let main_api           = null;
+let streamingProcessor = null;
+
+try {
+    const st = await import('../../../script.js');
+    getTokenCountAsync  = st.getTokenCountAsync  ?? null;
+    getGeneratingModel  = st.getGeneratingModel  ?? null;
+    main_api            = st.main_api            ?? null;
+    streamingProcessor  = st.streamingProcessor  ?? null;
+} catch { /* pre-V4 ST — use fallbacks */ }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Constants
 // ═══════════════════════════════════════════════════════════════════════════
 
-const EXT_NAME = 'token-cache-monitor';
-const MAX_HISTORY = 20;
-const LS_KEY = 'tcm_session_v2';
+const NAME     = 'token-cache-monitor';
+const HIST_MAX = 20;
+const LS_PFX   = 'tcm4_';
 
-/** Pricing per 1M tokens (USD), updated 2026-06.
- *  DeepSeek cache pricing: https://api-docs.deepseek.com/quick_start/pricing */
-const PRICING = {
-    'deepseek-v4-pro':   { input: 0.55, cacheHit: 0.14,  output: 2.19 },
-    'deepseek-v4-flash': { input: 0.14, cacheHit: 0.0028, output: 0.28 },
-    'deepseek-v3':       { input: 0.27, cacheHit: 0.07,  output: 1.10 },
-    // common fallbacks
-    'gpt-4o':            { input: 2.50, cacheHit: 1.25,  output: 10.00 },
-    'claude-3.5-sonnet': { input: 3.00, cacheHit: 0.30,  output: 15.00 },
+/** Pricing ¥/百万 tokens (人民币) */
+const PRICES = {
+    'deepseek-v4-pro':        { hit: 0.026, miss: 3.13, output: 6.26 },
+    'deepseek-v4-flash':      { hit: 0.020, miss: 1.01, output: 2.02 },
+    'deepseek-v3':            { hit: 0.1,   miss: 1.0,  output: 2.0  },
+    'deepseek-r1':            { hit: 1.0,   miss: 4.0,  output: 16.0 },
+    'claude-sonnet-4':        { hit: 1.09,  miss: 10.9, output: 54.5 },
+    'claude-sonnet-4-5':      { hit: 1.09,  miss: 10.9, output: 54.5 },
+    'claude-haiku-4-5':       { hit: 0.073, miss: 0.73, output: 3.64 },
+    'gpt-4o':                 { hit: 1.82,  miss: 18.2, output: 72.7 },
+    'gpt-4o-mini':            { hit: 0.073, miss: 0.73, output: 3.64 },
 };
 
-/** URL substrings that identify AI API endpoints */
-const API_PATTERNS = [
-    '/chat/completions',
-    '/completions',
-    '/v1/chat/completions',
-    '/v1/completions',
-    'api.deepseek.com',
-    'api.openai.com',
-    'api.anthropic.com',
-    'generativelanguage.googleapis.com',
-];
-
-/** DeepSeek-specific usage fields we want to capture */
-const DS_CACHE_FIELDS = [
-    'prompt_cache_hit_tokens',
-    'prompt_cache_miss_tokens',
-    'prompt_cache_write_tokens',
-    'prompt_tokens_details',
-    'completion_tokens_details',
-];
-
 // ═══════════════════════════════════════════════════════════════════════════
-// State
+// Settings
 // ═══════════════════════════════════════════════════════════════════════════
 
-const defaults = {
+const DEFAULTS = {
+    panelVisible:   true,
     panelCollapsed: false,
-    panelPosition:  { x: null, y: null },
-    showCacheInfo:  true,
+    panelPos:       { x: null, y: null },
+    showCache:      true,
     showSession:    true,
     showCost:       true,
     showThroughput: true,
     showTrend:      true,
-    costModel:      'deepseek-v4-pro',
-    customPricing:  { input: 0.55, cacheHit: 0.14, output: 2.19 },
+    showBadges:     true,
+    costModel:      'auto',       // 'auto' | 'deepseek-v4-pro' | ... | 'custom'
+    customPrice:    { hit: 0.1, miss: 1.0, output: 2.0 },
 };
 
-let cfg = { ...defaults };
-
-const stats = {
-    // Last request
-    lastPrompt:      0,
-    lastCompletion:  0,
-    lastCacheHit:    0,
-    lastCacheMiss:   0,
-    lastTime:        0,     // ms — when last request completed
-    lastDuration:    0,     // ms — generation duration
-    // Session totals
-    totalPrompt:     0,
-    totalCompletion: 0,
-    totalCacheHit:   0,
-    totalCacheMiss:  0,
-    requests:        0,
-    cost:            0,
-    totalDuration:   0,     // total generation ms
-    // Streaming
-    streamingCount:  0,
-    genStartTime:    0,
-    // History ring buffer
-    history:         [],
-};
+let cfg = { ...DEFAULTS };
+let _chatId = '';
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Persistent session state (localStorage)
+// Per-chat stats
 // ═══════════════════════════════════════════════════════════════════════════
 
-function saveSession() {
+function fresh() { return {
+    lastPrompt:0, lastCompletion:0, lastCacheHit:0, lastCacheMiss:0,
+    lastDuration:0, totalPrompt:0, totalCompletion:0, totalCacheHit:0,
+    totalCacheMiss:0, requests:0, cost:0, totalDuration:0,
+    streamTokens:0, genStart:0, lastSysPrompt:'', cacheBreaks:0,
+    history:[],
+    // multi-round tool-call
+    round:0, basePrompt:0, accCompletion:0, toolAcc:false, _finTimer:null,
+};}
+
+let S = fresh();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Persistence
+// ═══════════════════════════════════════════════════════════════════════════
+
+function chatId() {
     try {
-        const snap = {
-            totalPrompt:     stats.totalPrompt,
-            totalCompletion: stats.totalCompletion,
-            totalCacheHit:   stats.totalCacheHit,
-            totalCacheMiss:  stats.totalCacheMiss,
-            requests:        stats.requests,
-            cost:            stats.cost,
-            totalDuration:   stats.totalDuration,
-            history:         stats.history.slice(0, MAX_HISTORY),
-            savedAt:         Date.now(),
-        };
-        localStorage.setItem(LS_KEY, JSON.stringify(snap));
-    } catch { /* quota exceeded — non-critical */ }
+        const c = getContext();
+        return c?.chatId || c?.chat?.chat_id || c?.chatMetadata?.chat_id || 'default';
+    } catch { return 'default'; }
+}
+function lsKey(id) { return LS_PFX + (id || _chatId); }
+
+function save() {
+    if (!_chatId) return;
+    try { localStorage.setItem(lsKey(), JSON.stringify({
+        totalPrompt:S.totalPrompt, totalCompletion:S.totalCompletion,
+        totalCacheHit:S.totalCacheHit, totalCacheMiss:S.totalCacheMiss,
+        requests:S.requests, cost:S.cost, totalDuration:S.totalDuration,
+        cacheBreaks:S.cacheBreaks, history:S.history.slice(0,HIST_MAX),
+        savedAt:Date.now(),
+    }));} catch {}
 }
 
-function loadSession() {
+function load(id) {
     try {
-        const raw = localStorage.getItem(LS_KEY);
-        if (!raw) return;
-        const snap = JSON.parse(raw);
-        if (snap.totalPrompt !== undefined)     stats.totalPrompt     = snap.totalPrompt;
-        if (snap.totalCompletion !== undefined) stats.totalCompletion = snap.totalCompletion;
-        if (snap.totalCacheHit !== undefined)   stats.totalCacheHit   = snap.totalCacheHit;
-        if (snap.totalCacheMiss !== undefined)  stats.totalCacheMiss  = snap.totalCacheMiss;
-        if (snap.requests !== undefined)        stats.requests        = snap.requests;
-        if (snap.cost !== undefined)            stats.cost            = snap.cost;
-        if (snap.totalDuration !== undefined)   stats.totalDuration   = snap.totalDuration;
-        if (Array.isArray(snap.history))        stats.history         = snap.history.slice(0, MAX_HISTORY);
-    } catch { /* ignore parse errors */ }
+        const r = localStorage.getItem(lsKey(id));
+        if (!r) return fresh();
+        const d = JSON.parse(r), s = fresh();
+        if (d.totalPrompt    !==undefined) s.totalPrompt    =d.totalPrompt;
+        if (d.totalCompletion!==undefined) s.totalCompletion=d.totalCompletion;
+        if (d.totalCacheHit  !==undefined) s.totalCacheHit  =d.totalCacheHit;
+        if (d.totalCacheMiss !==undefined) s.totalCacheMiss =d.totalCacheMiss;
+        if (d.requests       !==undefined) s.requests       =d.requests;
+        if (d.cost           !==undefined) s.cost           =d.cost;
+        if (d.totalDuration  !==undefined) s.totalDuration  =d.totalDuration;
+        if (d.cacheBreaks    !==undefined) s.cacheBreaks    =d.cacheBreaks;
+        if (Array.isArray(d.history))       s.history       =d.history.slice(0,HIST_MAX);
+        return s;
+    } catch { return fresh(); }
 }
 
-function clearSession() {
-    try { localStorage.removeItem(LS_KEY); } catch { /* ignore */ }
+function swapChat(newId) {
+    if (newId === _chatId) return;
+    save(); _chatId = newId; S = load(newId);
+    refresh();
+}
+
+function reset() {
+    S = fresh();
+    try { localStorage.removeItem(lsKey()); } catch {}
+    refresh();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Settings helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+function loadCfg() {
+    if (extSettings[NAME]) cfg = { ...DEFAULTS, ...extSettings[NAME] };
+}
+function saveCfg() { extSettings[NAME] = cfg; saveSettingsDebounced(); }
+
+function getPrice(model) {
+    if (cfg.costModel !== 'auto') return PRICES[cfg.costModel] || null;
+    if (!model) return null;
+    const m = model.toLowerCase();
+    for (const [k, v] of Object.entries(PRICES))
+        if (m.includes(k.replace(/-/g,''))) return v;
+    return null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Formatting
+// ═══════════════════════════════════════════════════════════════════════════
+
+function fmt(n) {
+    if (n == null || isNaN(n)) return '-';
+    if (n >= 1e8) return (n/1e8).toFixed(1)+'亿';
+    if (n >= 1e4) return (n/1e4).toFixed(1)+'万';
+    if (n >= 1e3) return n.toLocaleString();
+    return String(Math.round(n));
+}
+function fc(n) {
+    if (n == null || isNaN(n)) return '¥0';
+    if (n >= 1) return '¥'+n.toFixed(2);
+    if (n >= 0.01) return '¥'+n.toFixed(4);
+    return '¥'+n.toFixed(6);
+}
+function estTokens(t) {
+    if (!t || typeof t !== 'string') return 0;
+    const cjk = (t.match(/[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]/g)||[]).length;
+    return Math.ceil(cjk/1.5) + Math.ceil((t.length-cjk)/4);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Cache detection
+// ═══════════════════════════════════════════════════════════════════════════
+
+function detectCache(u) {
+    if (!u) return { s:null, d:'', hit:0 };
+
+    // Anthropic
+    if (u.cache_read_input_tokens !== undefined) {
+        const r=u.cache_read_input_tokens||0, c=u.cache_creation_input_tokens||0;
+        const i=u.input_tokens||0;
+        if (r>0&&c>0) return {s:'PARTIAL',d:`创建${fmt(c)}·读取${fmt(r)}`,hit:r};
+        if (r>0) return {s:'HIT',d:`${fmt(r)}/${fmt(i)}`,hit:r};
+        if (c>0) return {s:'MISS',d:`创建${fmt(c)}`,hit:0};
+        return {s:'MISS',d:'无缓存',hit:0};
+    }
+    // DeepSeek
+    if (u.prompt_cache_hit_tokens!==undefined||u.prompt_cache_miss_tokens!==undefined) {
+        const h=u.prompt_cache_hit_tokens||0, m=u.prompt_cache_miss_tokens||0;
+        if (h>0&&m>0) return {s:'PARTIAL',d:`命中${fmt(h)}·未中${fmt(m)}`,hit:h};
+        if (h>0) return {s:'HIT',d:`${fmt(h)} tokens`,hit:h};
+        return {s:'MISS',d:`首次请求`,hit:0};
+    }
+    // OpenAI
+    if (u.prompt_tokens_details?.cached_tokens!==undefined) {
+        const c=u.prompt_tokens_details.cached_tokens||0, p=u.prompt_tokens||0;
+        if (c>0) return {s:c<p?'PARTIAL':'HIT',d:`${fmt(c)}/${fmt(p)}`,hit:c};
+        return {s:'MISS',d:'无缓存',hit:0};
+    }
+    return {s:null,d:'',hit:0};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Data extraction from ST internals
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function getUsage() {
+    try {
+        const ctx = getContext();
+        if (typeof ctx?.generateRawData === 'function') {
+            const r = await ctx.generateRawData();
+            if (r?.usage) return r.usage;
+        }
+    } catch {}
+    if (main_api?.lastResponse?.usage) return main_api.lastResponse.usage;
+    if (streamingProcessor?.lastResponse?.usage) return streamingProcessor.lastResponse.usage;
+    return null;
+}
+
+async function countPrompt() {
+    try {
+        const ctx = getContext();
+        let text = '';
+        if (typeof ctx?.getPrompt === 'function') text = await ctx.getPrompt();
+        if (!text && ctx?.chat) text = ctx.chat.map(m=>(m.mes||'')).join('\n');
+        if (!text) return 0;
+        if (getTokenCountAsync) return await getTokenCountAsync(text) || estTokens(text);
+        return estTokens(text);
+    } catch { return 0; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Record
+// ═══════════════════════════════════════════════════════════════════════════
+
+function record(prompt, completion, cacheHit, cacheMiss, dur) {
+    const now=Date.now();
+    S.lastPrompt=prompt; S.lastCompletion=completion;
+    S.lastCacheHit=cacheHit; S.lastCacheMiss=cacheMiss;
+    S.lastDuration=dur||(now-(S.genStart||now));
+
+    S.totalPrompt+=prompt; S.totalCompletion+=completion;
+    S.totalCacheHit+=cacheHit; S.totalCacheMiss+=cacheMiss;
+    S.requests++; S.totalDuration+=S.lastDuration; S.streamTokens=0;
+
+    const pr = getPrice(stateModel());
+    if (pr) {
+        S.cost += (cacheMiss/1e6)*pr.miss + (cacheHit/1e6)*pr.hit + (completion/1e6)*pr.output;
+    }
+
+    const tps = S.lastDuration>0?Math.round(completion/(S.lastDuration/1000)):0;
+    const eff = (cacheHit+cacheMiss)>0?Math.round(cacheHit/(cacheHit+cacheMiss)*100):0;
+
+    S.history.unshift({time:now,prompt,completion,cacheHit,cacheMiss,tps,eff,duration:S.lastDuration});
+    if (S.history.length>HIST_MAX) S.history.pop();
+    save(); refresh();
+}
+
+function stateModel() {
+    try { return getGeneratingModel?.()?.label || getGeneratingModel?.()?.id || null; } catch { return null; }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Cache-breaker
+// ═══════════════════════════════════════════════════════════════════════════
+
+function checkPrefix() {
+    const ctx=getContext(); if(!ctx?.chat)return;
+    const cur=(ctx.chat.system_prompt||'').slice(0,2000);
+    if(S.lastSysPrompt&&S.lastSysPrompt!==cur&&S.requests>0)S.cacheBreaks++;
+    S.lastSysPrompt=cur;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Event handlers
+// ═══════════════════════════════════════════════════════════════════════════
+
+async function onGenStart() {
+    if (S._finTimer) { clearTimeout(S._finTimer); S._finTimer=null; }
+    S.round++; S.genStart=Date.now(); S.streamTokens=0;
+    if (S.round>=2) S.toolAcc=true;
+
+    if (S.round===1) {
+        S.basePrompt = await countPrompt();
+        S.lastPrompt = S.basePrompt;
+    }
+    checkPrefix();
+    refresh();
+}
+
+function onStreamToken(t) {
+    S.streamTokens += (typeof t==='string')?estTokens(t):1;
+    if (S.streamTokens%5===0) refresh();
+}
+
+async function onGenEnd() {
+    const dur = S.genStart?Date.now()-S.genStart:0;
+    const usage = await getUsage();
+
+    if (usage) {
+        const rc = usage.output_tokens!==undefined?usage.output_tokens:(usage.completion_tokens||0);
+        S.accCompletion += rc;
+        S.lastCompletion = S.accCompletion;
+
+        if (S.round===1) {
+            const pc = usage.input_tokens!==undefined?usage.input_tokens:(usage.prompt_tokens||S.basePrompt);
+            S.lastPrompt = S.basePrompt = pc;
+        }
+
+        const ca = detectCache(usage);
+        S.lastCacheHit = ca.hit;
+        S.lastCacheMiss = (usage.input_tokens||usage.prompt_tokens||S.basePrompt) - ca.hit;
+        record(S.lastPrompt, S.lastCompletion, S.lastCacheHit, Math.max(0,S.lastCacheMiss), dur);
+    } else {
+        S.accCompletion += S.streamTokens;
+        S.lastCompletion = S.accCompletion;
+    }
+
+    S.streamTokens=0; S.genStart=0;
+
+    // Multi-round debounce
+    if (S._finTimer) clearTimeout(S._finTimer);
+    S._finTimer = setTimeout(() => { S.toolAcc=false; S.round=0; refresh(); }, 3000);
+
+    if (cfg.showBadges) setTimeout(addBadge, 250);
+    refresh();
+}
+
+function onGenStop() {
+    S.accCompletion += S.streamTokens;
+    S.lastCompletion = S.accCompletion;
+    S.streamTokens=0; S.genStart=0;
+    refresh();
+}
+
+function onChatChange() { swapChat(chatId()); }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Per-message badge
+// ═══════════════════════════════════════════════════════════════════════════
+
+function addBadge() {
+    const ms = document.querySelectorAll('.mes');
+    if (!ms.length) return;
+    const last = ms[ms.length-1];
+    if (last.querySelector('.tcm-badge')) return;
+
+    const p=S.lastPrompt, c=S.lastCompletion, ch=S.lastCacheHit;
+    const rate=p>0?Math.round(ch/p*100):null;
+    const cr=(rate??0)>=50?'#4caf50':(rate??0)>=20?'#ff9800':'#f44336';
+    const pr=getPrice(stateModel());
+    const cost=pr?((S.lastCacheMiss/1e6)*pr.miss+(ch/1e6)*pr.hit+(c/1e6)*pr.output):0;
+
+    const b=document.createElement('div'); b.className='tcm-badge';
+    b.innerHTML=`<span class="tcm-bp">P:${fmt(p)}</span><span class="tcm-bc">C:${fmt(c)}</span>`+
+        (ch>0?`<span class="tcm-bh" style="color:${cr}">⚡${fmt(ch)}(${rate??0}%)</span>`:'')+
+        `<span class="tcm-b$">${fc(cost)}</span>`;
+    last.appendChild(b);
+}
+
+function startBadgeObs() {
+    if (!cfg.showBadges) return;
+    const a=document.querySelector('#chat');
+    if (!a) return setTimeout(startBadgeObs,1000);
+    new MutationObserver(ms=>{for(const m of ms)for(const n of m.addedNodes)
+        if(n.nodeType===1&&(n.classList?.contains('mes')||n.querySelector?.('.mes')))
+            setTimeout(addBadge,300);
+    }).observe(a,{childList:true,subtree:true});
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Analytics
+// ═══════════════════════════════════════════════════════════════════════════
+
+function cScore(){const t=S.totalCacheHit+S.totalCacheMiss;return t>0?Math.round(S.totalCacheHit/t*100):0;}
+function sLabel(s){return s>=80?{t:'优秀',c:'#4caf50'}:s>=50?{t:'良好',c:'#8bc34a'}:s>=30?{t:'一般',c:'#ff9800'}:{t:'偏低',c:'#f44336'};}
+function avgT(){const v=S.history.filter(h=>h.tps>0);return v.length?Math.round(v.reduce((a,h)=>a+h.tps,0)/v.length):0;}
+function avgR(){return S.requests?Math.round((S.totalPrompt+S.totalCompletion)/S.requests):0;}
+function projCost(n){return S.requests?S.cost+(S.cost/S.requests)*n:0;}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UI
+// ═══════════════════════════════════════════════════════════════════════════
+
+let root=null, drag=false, dX=0, dY=0;
+function $(s){return root?.querySelector(s);}
+
+function render() {
+    if (!root) return;
+    const gen=getContext()?.generating??false;
+    const lTot=S.lastPrompt+S.lastCompletion+S.streamTokens;
+    const sTot=S.totalPrompt+S.totalCompletion+S.streamTokens;
+    const lRate=S.lastPrompt>0?Math.round(S.lastCacheHit/S.lastPrompt*100):null;
+    const eff=cScore(), el=sLabel(eff);
+    const tps=avgT(), lTps=S.lastDuration>0?Math.round((S.lastCompletion||S.streamTokens)/(S.lastDuration/1000)):0;
+
+    put('tcm-p',fmt(S.lastPrompt)); put('tcm-c',fmt(S.lastCompletion+S.streamTokens));
+    put('tcm-t',fmt(lTot)); put('tcm-s',lTps>0?lTps+' tok/s':'-');
+    put('tcm-h',fmt(S.lastCacheHit)); put('tcm-m',fmt(S.lastCacheMiss));
+    put('tcm-r',lRate!==null?lRate+'%':'-');
+    put('tcm-e',eff); put('tcm-el',el.t);
+    put('tcm-sp',fmt(S.totalPrompt)); put('tcm-sc',fmt(S.totalCompletion+S.streamTokens));
+    put('tcm-st',fmt(sTot)); put('tcm-sr',S.requests); put('tcm-sa',fmt(avgR()));
+    put('tcm-ss',tps>0?tps+' tok/s':'-');
+    put('tcm-co',fc(S.cost)); put('tcm-cp',fc(projCost(50)));
+    put('tcm-d',gen?'🟢':'⚪');
+
+    const cb=$('#tcm-cw'); if(cb)cb.style.display=S.cacheBreaks>0?'':'none';
+    const re=$('#tcm-r'); if(re&&lRate!==null)re.style.color=lRate>=50?'#4caf50':lRate>=20?'#ff9800':'#f44336';
+    const ba=$('#tcm-ef'); if(ba){ba.style.width=eff+'%';ba.style.background=el.c;}
+    drawT();
+}
+
+function put(i,v){const e=$(`#${i}`);if(e)e.textContent=v;}
+
+function drawT(){
+    const ct=$('#tcm-tb');if(!ct||!cfg.showTrend)return;
+    const bars=ct.querySelectorAll('.tcm-tb');
+    const items=S.history.slice(0,bars.length).reverse();
+    bars.forEach((b,i)=>{
+        const it=items[i];
+        if(it){const mx=Math.max(it.prompt,it.completion,1);
+            b.querySelector('.tcm-tp').style.height=(it.prompt/mx*100)+'%';
+            b.querySelector('.tcm-tc').style.height=(it.completion/mx*100)+'%';
+            b.title=`#${S.requests-items.length+i+1}: P=${fmt(it.prompt)} C=${fmt(it.completion)} @${it.tps} tok/s`;
+            b.style.opacity='1';}
+        else{b.querySelector('.tcm-tp').style.height='0%';b.querySelector('.tcm-tc').style.height='0%';b.style.opacity='0.35';}
+    });
+}
+
+const B=Array.from({length:HIST_MAX},()=>`<div class="tcm-tb"><div class="tcm-tp"></div><div class="tcm-tc"></div></div>`).join('');
+
+const P=/*html*/`
+<div id="tcm-panel" class="tcm-p${cfg.panelCollapsed?' tcm-c':''}">
+  <div class="tcm-hd">
+    <span class="tcm-hl"><span id="tcm-d">⚪</span> Token Monitor</span>
+    <span class="tcm-hr">
+      <button class="tcm-b" id="tcm-bs" title="设置">⚙</button>
+      <button class="tcm-b" id="tcm-bt" title="折叠">${cfg.panelCollapsed?'➕':'➖'}</button>
+      <button class="tcm-b" id="tcm-br" title="重置">↺</button>
+      <button class="tcm-b" id="tcm-bx" title="隐藏">✕</button>
+    </span>
+  </div>
+  <div class="tcm-bd"${cfg.panelCollapsed?' style="display:none"':''}>
+    <div id="tcm-cw" class="tcm-cw" style="display:${S.cacheBreaks>0?'':'none'}">⚠ 缓存断裂 ${S.cacheBreaks}次 — prefix 已变化</div>
+    <div class="tcm-s">
+      <div class="tcm-st">▼ 最近</div>
+      <div class="tcm-rx"><span>Prompt</span><span id="tcm-p">-</span></div>
+      <div class="tcm-rx"><span>Completion</span><span id="tcm-c">-</span></div>
+      <div class="tcm-rx"><span>总计</span><span id="tcm-t">-</span></div>
+      <div class="tcm-rx" id="tcm-sr"${cfg.showThroughput?'':' style="display:none"'}><span>速度</span><span id="tcm-s">-</span></div>
+    </div>
+    <div class="tcm-s" id="tcm-cs"${cfg.showCache?'':' style="display:none"'}>
+      <div class="tcm-st">▼ 缓存</div>
+      <div class="tcm-rx"><span>命中</span><span class="tcm-g" id="tcm-h">-</span></div>
+      <div class="tcm-rx"><span>未命中</span><span class="tcm-r2" id="tcm-m">-</span></div>
+      <div class="tcm-rx"><span>命中率</span><span id="tcm-r">-</span></div>
+      <div class="tcm-rx"><span>效率</span><span><span id="tcm-e">0</span> <span id="tcm-el" style="font-size:9px">-</span></span></div>
+      <div class="tcm-eb"><div class="tcm-ef" id="tcm-ef"></div></div>
+    </div>
+    <div class="tcm-s" id="tcm-ss"${cfg.showSession?'':' style="display:none"'}>
+      <div class="tcm-st">▼ 会话</div>
+      <div class="tcm-rx"><span>Prompt</span><span id="tcm-sp">0</span></div>
+      <div class="tcm-rx"><span>Completion</span><span id="tcm-sc">0</span></div>
+      <div class="tcm-rx"><span>总计</span><span id="tcm-st">0</span></div>
+      <div class="tcm-rx"><span>请求</span><span id="tcm-sr">0</span></div>
+      <div class="tcm-rx"><span>均/请求</span><span id="tcm-sa">0</span></div>
+      <div class="tcm-rx"><span>均速度</span><span id="tcm-ss">-</span></div>
+    </div>
+    <div class="tcm-s" id="tcm-cos"${cfg.showCost?'':' style="display:none"'}>
+      <div class="tcm-st">▼ 费用 (¥)</div>
+      <div class="tcm-rx"><span>本对话</span><span class="tcm-y" id="tcm-co">¥0</span></div>
+      <div class="tcm-rx"><span>+50预估</span><span class="tcm-y" id="tcm-cp">¥0</span></div>
+    </div>
+    <div class="tcm-s" id="tcm-ts"${cfg.showTrend?'':' style="display:none"'}>
+      <div class="tcm-st">▼ 趋势</div>
+      <div class="tcm-tr"><div class="tcm-tb" id="tcm-tb">${B}</div>
+        <div class="tcm-tl"><span><span class="tcm-lp"></span>Prompt</span><span><span class="tcm-lc"></span>Completion</span></div>
+      </div>
+    </div>
+  </div>
+</div>`;
+
+function build() {
+    if(root)root.remove();
+    const w=document.createElement('div');w.innerHTML=P;root=w.firstElementChild;
+    document.body.appendChild(root);place();wire();render();
+}
+function place(){
+    if(!root)return;
+    if(cfg.panelPos.x!==null){root.style.right=root.style.bottom='auto';root.style.left=cfg.panelPos.x+'px';root.style.top=cfg.panelPos.y+'px';}
+    else{root.style.left=root.style.top='auto';root.style.right='12px';root.style.bottom='90px';}
+}
+function wire(){
+    $('#tcm-bt')?.addEventListener('click',()=>{
+        cfg.panelCollapsed=!cfg.panelCollapsed;saveCfg();
+        const bd=root.querySelector('.tcm-bd'),bt=$('#tcm-bt');
+        if(cfg.panelCollapsed){bd.style.display='none';if(bt)bt.textContent='➕';root.classList.add('tcm-c');}
+        else{bd.style.display='';if(bt)bt.textContent='➖';root.classList.remove('tcm-c');}
+    });
+    $('#tcm-br')?.addEventListener('click',reset);
+    $('#tcm-bx')?.addEventListener('click',()=>{root.style.display='none';showToggle();});
+    $('#tcm-bs')?.addEventListener('click',settings);
+    const h=root.querySelector('.tcm-hd');
+    h?.addEventListener('mousedown',e=>{if(e.target.tagName==='BUTTON')return;drag=true;const r=root.getBoundingClientRect();dX=e.clientX-r.left;dY=e.clientY-r.top;root.style.cursor='grabbing';e.preventDefault();});
+    h?.addEventListener('touchstart',e=>{if(e.target.tagName==='BUTTON')return;const t=e.touches[0];drag=true;const r=root.getBoundingClientRect();dX=t.clientX-r.left;dY=t.clientY-r.top;root.style.cursor='grabbing';},{passive:true});
+    h?.addEventListener('dblclick',()=>{cfg.panelCollapsed=!cfg.panelCollapsed;saveCfg();rebuild();});
+    document.addEventListener('mousemove',e=>{if(!drag)return;cfg.panelPos.x=e.clientX-dX;cfg.panelPos.y=e.clientY-dY;root.style.right=root.style.bottom='auto';root.style.left=cfg.panelPos.x+'px';root.style.top=cfg.panelPos.y+'px';});
+    document.addEventListener('touchmove',e=>{if(!drag)return;const t=e.touches[0];cfg.panelPos.x=t.clientX-dX;cfg.panelPos.y=t.clientY-dY;root.style.right=root.style.bottom='auto';root.style.left=cfg.panelPos.x+'px';root.style.top=cfg.panelPos.y+'px';},{passive:false});
+    document.addEventListener('mouseup',()=>{if(!drag)return;drag=false;root.style.cursor='';saveCfg();});
+    document.addEventListener('touchend',()=>{if(!drag)return;drag=false;root.style.cursor='';saveCfg();});
+}
+function rebuild(){
+    if(!root)return build();
+    const pos=cfg.panelPos,col=cfg.panelCollapsed;root.remove();root=null;build();
+    if(col){cfg.panelCollapsed=true;const bd=root.querySelector('.tcm-bd');bd.style.display='none';root.classList.add('tcm-c');}
+    if(pos.x!==null){root.style.left=pos.x+'px';root.style.top=pos.y+'px';root.style.right=root.style.bottom='auto';}
+    ['tcm-cs','tcm-ss','tcm-cos','tcm-ts','tcm-sr'].forEach(id=>{
+        const e=$(`#${id}`);if(!e)return;
+        if(id==='tcm-cs')e.style.display=cfg.showCache?'':'none';
+        if(id==='tcm-ss')e.style.display=cfg.showSession?'':'none';
+        if(id==='tcm-cos')e.style.display=cfg.showCost?'':'none';
+        if(id==='tcm-ts')e.style.display=cfg.showTrend?'':'none';
+        if(id==='tcm-sr')e.style.display=cfg.showThroughput?'':'none';
+    });render();
+}
+
+// ── Toggle Σ button ──────────────────────────────────────────────────
+
+let tgl=null;
+function showToggle(){
+    if(tgl){tgl.style.display='flex';return;}
+    tgl=document.createElement('div');tgl.id='tcm-tgl';tgl.title='Token Monitor';
+    tgl.innerHTML='<span style="font-size:18px;line-height:1">Σ</span>';
+    Object.assign(tgl.style,{position:'fixed',zIndex:'9998',cursor:'pointer',width:'36px',height:'36px',borderRadius:'8px',
+        background:'var(--SmartThemeBodyColor,#2a2a2a)',color:'var(--SmartThemeBodyTextColor,#ccc)',
+        display:'flex',alignItems:'center',justifyContent:'center',boxShadow:'0 2px 8px rgba(0,0,0,0.3)',
+        opacity:'0.7',transition:'opacity .2s',userSelect:'none',right:'12px',bottom:'50px'});
+    tgl.addEventListener('mouseenter',()=>tgl.style.opacity='1');
+    tgl.addEventListener('mouseleave',()=>tgl.style.opacity='0.7');
+    tgl.addEventListener('click',()=>{if(root)root.style.display='';tgl.style.display='none';cfg.panelVisible=true;saveCfg();});
+    document.body.appendChild(tgl);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Settings
 // ═══════════════════════════════════════════════════════════════════════════
 
-function loadCfg() {
-    if (extensionSettings[EXT_NAME]) {
-        cfg = { ...defaults, ...extensionSettings[EXT_NAME] };
-    }
-}
-
-function saveCfg() {
-    extensionSettings[EXT_NAME] = cfg;
-    saveSettingsDebounced();
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Pricing helpers
-// ═══════════════════════════════════════════════════════════════════════════
-
-function getPricing() {
-    return cfg.costModel === 'custom'
-        ? cfg.customPricing
-        : (PRICING[cfg.costModel] || PRICING['deepseek-v4-pro']);
-}
-
-function currentModelName() {
-    try { return getContext().onlineStatus !== 'no_connection' ? (getContext().chatMetadata?.model || cfg.costModel) : cfg.costModel; }
-    catch { return cfg.costModel; }
-}
-
-/** Auto-detect if the current backend is DeepSeek */
-function isDeepSeekBackend() {
-    try {
-        const api = getContext().getApiUrl?.() || '';
-        return api.includes('deepseek');
-    } catch { return false; }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Record a completed request
-// ═══════════════════════════════════════════════════════════════════════════
-
-function record(prompt, completion, cacheHit, cacheMiss, durationMs) {
-    const now = Date.now();
-
-    stats.lastPrompt     = prompt;
-    stats.lastCompletion = completion;
-    stats.lastCacheHit   = cacheHit;
-    stats.lastCacheMiss  = cacheMiss;
-    stats.lastTime       = now;
-    stats.lastDuration   = durationMs || (now - (stats.genStartTime || now));
-
-    stats.totalPrompt     += prompt;
-    stats.totalCompletion += completion;
-    stats.totalCacheHit   += cacheHit;
-    stats.totalCacheMiss  += cacheMiss;
-    stats.requests++;
-    stats.totalDuration   += stats.lastDuration;
-    stats.streamingCount   = 0;
-
-    // Cost calculation: cache-hit tokens charged at cache rate, miss at input rate
-    const p  = getPricing();
-    const costThis = (cacheMiss  / 1_000_000) * p.input
-                   + (cacheHit   / 1_000_000) * p.cacheHit
-                   + (completion / 1_000_000) * p.output;
-    stats.cost += costThis;
-
-    // Throughput (tokens/sec)
-    const tps = stats.lastDuration > 0
-        ? Math.round(completion / (stats.lastDuration / 1000))
-        : 0;
-
-    // Cache efficiency score: 0-100
-    const totalInput = cacheHit + cacheMiss;
-    const effScore = totalInput > 0 ? Math.round((cacheHit / totalInput) * 100) : 0;
-
-    stats.history.unshift({
-        time: now,
-        prompt, completion, cacheHit, cacheMiss,
-        cost: costThis,
-        tps,
-        effScore,
-        duration: stats.lastDuration,
-    });
-    if (stats.history.length > MAX_HISTORY) stats.history.pop();
-
-    saveSession();
-    refresh();
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Network interception (fetch monkey-patch)
-// ═══════════════════════════════════════════════════════════════════════════
-
-function matchesAPI(url) {
-    if (!url) return false;
-    return API_PATTERNS.some(p => url.includes(p));
-}
-
-function extractUsage(data) {
-    if (!data) return null;
-    // OpenAI / DeepSeek
-    if (data?.usage?.prompt_tokens !== undefined) return data.usage;
-    // Anthropic
-    if (data?.usage?.input_tokens !== undefined) {
-        const u = data.usage;
-        return {
-            prompt_tokens: u.input_tokens,
-            completion_tokens: u.output_tokens,
-            prompt_cache_hit_tokens: u.cache_read_input_tokens || 0,
-            prompt_cache_write_tokens: u.cache_creation_input_tokens || 0,
-        };
-    }
-    // Gemini
-    if (data?.usageMetadata) {
-        const u = data.usageMetadata;
-        return {
-            prompt_tokens: u.promptTokenCount,
-            completion_tokens: u.candidatesTokenCount,
-        };
-    }
-    return null;
-}
-
-/** Read SSE stream to extract usage from the final chunk */
-async function interceptStream(response) {
-    const reader = response.clone().body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    let usage = null;
-
-    try {
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buf += decoder.decode(value, { stream: true });
-
-            const lines = buf.split('\n');
-            buf = lines.pop() || '';
-
-            for (const line of lines) {
-                const data = line.startsWith('data: ') ? line.slice(6).trim() : '';
-                if (!data || data === '[DONE]') continue;
-                try {
-                    const chunk = JSON.parse(data);
-                    if (chunk.usage) usage = chunk.usage;
-                    // OpenAI streaming: usage may be nested
-                    if (chunk.choices?.[0]?.usage) usage = chunk.choices[0].usage;
-                    // DeepSeek: sometimes usage is at top level
-                    if (chunk.usage?.prompt_tokens !== undefined) usage = chunk.usage;
-                } catch { /* ignore parse errors */ }
-            }
-        }
-        // Flush remaining
-        if (buf.startsWith('data: ') && buf.slice(6).trim() !== '[DONE]') {
-            try {
-                const chunk = JSON.parse(buf.slice(6).trim());
-                if (chunk.usage) usage = chunk.usage;
-            } catch { /* ignore */ }
-        }
-    } catch { /* stream read error — non-fatal */ }
-
-    return usage;
-}
-
-function patchFetch() {
-    const _fetch = window.fetch;
-    window.fetch = async function (...args) {
-        const url = typeof args[0] === 'string'
-            ? args[0]
-            : args[0]?.url || '';
-
-        const resp = await _fetch.apply(this, args);
-
-        if (!matchesAPI(url)) return resp;
-
-        // Fire and forget — don't block the response
-        (async () => {
-            try {
-                const ct = resp.headers.get('content-type') || '';
-
-                if (ct.includes('text/event-stream')) {
-                    const usage = await interceptStream(resp);
-                    if (usage) {
-                        const pt = usage.prompt_tokens || 0;
-                        const ct2 = usage.completion_tokens || 0;
-                        const ch = usage.prompt_cache_hit_tokens || 0;
-                        const cm = usage.prompt_cache_miss_tokens !== undefined
-                            ? usage.prompt_cache_miss_tokens
-                            : Math.max(0, pt - ch);
-                        record(pt, ct2, ch, cm);
-                    }
-                } else {
-                    const clone = resp.clone();
-                    const data  = await clone.json().catch(() => null);
-                    const usage = extractUsage(data);
-                    if (usage) {
-                        const pt = usage.prompt_tokens || 0;
-                        const ct2 = usage.completion_tokens || 0;
-                        const ch = usage.prompt_cache_hit_tokens || 0;
-                        const cm = usage.prompt_cache_miss_tokens !== undefined
-                            ? usage.prompt_cache_miss_tokens
-                            : Math.max(0, pt - ch);
-                        record(pt, ct2, ch, cm);
-                    }
-                }
-            } catch { /* silently ignore — best-effort tracking */ }
-        })();
-
-        return resp;
-    };
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// ST Event hooks
-// ═══════════════════════════════════════════════════════════════════════════
-
-function hookEvents() {
-    eventSource.on(event_types.GENERATION_STARTED, () => {
-        stats.streamingCount = 0;
-        stats.genStartTime = Date.now();
-        refresh();
-    });
-
-    eventSource.on(event_types.STREAM_TOKEN_RECEIVED, () => {
-        stats.streamingCount++;
-        // Throttle UI updates during fast streaming
-        if (stats.streamingCount % 5 === 0) refresh();
-    });
-
-    eventSource.on(event_types.GENERATION_ENDED, (data) => {
-        const duration = stats.genStartTime ? Date.now() - stats.genStartTime : 0;
-
-        // If ST passes usage in the event data, use it as primary source
-        if (data?.usage?.prompt_tokens !== undefined) {
-            const u = data.usage;
-            record(
-                u.prompt_tokens || 0,
-                u.completion_tokens || stats.streamingCount,
-                u.prompt_cache_hit_tokens || 0,
-                u.prompt_cache_miss_tokens !== undefined
-                    ? u.prompt_cache_miss_tokens
-                    : Math.max(0, (u.prompt_tokens || 0) - (u.prompt_cache_hit_tokens || 0)),
-                duration
-            );
-        } else if (stats.streamingCount > 0 && stats.lastCompletion === 0) {
-            // Fallback: use stream token count (no usage data captured)
-            const p = getPricing();
-            stats.lastCompletion = stats.streamingCount;
-            stats.totalCompletion += stats.streamingCount;
-            stats.lastTime = Date.now();
-            stats.lastDuration = duration;
-            stats.totalDuration += duration;
-            stats.requests++;
-            stats.cost += (stats.streamingCount / 1_000_000) * p.output;
-            stats.streamingCount = 0;
-            saveSession();
-        }
-
-        stats.streamingCount = 0;
-        stats.genStartTime = 0;
-        refresh();
-    });
-
-    // Reset session tracking when chat changes
-    eventSource.on(event_types.CHAT_CHANGED, () => {
-        resetStats();
-        refresh();
-    });
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Analytics helpers
-// ═══════════════════════════════════════════════════════════════════════════
-
-/** Overall cache efficiency score 0-100 */
-function cacheEfficiencyScore() {
-    const total = stats.totalCacheHit + stats.totalCacheMiss;
-    return total > 0 ? Math.round((stats.totalCacheHit / total) * 100) : 0;
-}
-
-/** Average tokens per request */
-function avgTokensPerRequest() {
-    return stats.requests > 0
-        ? Math.round((stats.totalPrompt + stats.totalCompletion) / stats.requests)
-        : 0;
-}
-
-/** Average throughput (tokens/sec) from history */
-function avgThroughput() {
-    if (stats.history.length === 0) return 0;
-    const valid = stats.history.filter(h => h.tps > 0);
-    if (valid.length === 0) return 0;
-    return Math.round(valid.reduce((s, h) => s + h.tps, 0) / valid.length);
-}
-
-/** Projected cost if we continue at current rate for N more messages */
-function projectedCost(remainingMsgs = 50) {
-    if (stats.requests === 0) return 0;
-    const avgCostPerReq = stats.cost / stats.requests;
-    return stats.cost + avgCostPerReq * remainingMsgs;
-}
-
-/** Cache efficiency label */
-function effLabel(score) {
-    if (score >= 80) return { text: 'Excellent', color: '#4caf50' };
-    if (score >= 50) return { text: 'Good',     color: '#8bc34a' };
-    if (score >= 30) return { text: 'Fair',     color: '#ff9800' };
-    return              { text: 'Low',       color: '#f44336' };
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// UI
-// ═══════════════════════════════════════════════════════════════════════════
-
-let root = null;
-let dragging = false, dX = 0, dY = 0;
-
-function $(sel) { return root?.querySelector(sel); }
-function $$(sel) { return root?.querySelectorAll(sel); }
-
-function fmt(n) {
-    if (n === undefined || n === null || isNaN(n)) return '-';
-    if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
-    if (n >= 1_000)    return (n / 1_000).toFixed(1) + 'k';
-    return String(Math.round(n));
-}
-
-function fmtCost(n) {
-    if (n === undefined || n === null || isNaN(n)) return '$0.00000';
-    return '$' + n.toFixed(5);
-}
-
-function render() {
-    if (!root) return;
-    const ctx = getContext();
-    const generating = ctx?.generating ?? false;
-
-    const lastTotal = stats.lastPrompt + stats.lastCompletion + stats.streamingCount;
-    const sessionTotal = stats.totalPrompt + stats.totalCompletion + stats.streamingCount;
-    const lastCacheRate = stats.lastPrompt > 0
-        ? Math.round((stats.lastCacheHit / stats.lastPrompt) * 100)
-        : null;
-    const effScore = cacheEfficiencyScore();
-    const eff = effLabel(effScore);
-    const tps = avgThroughput();
-
-    // Last request
-    setText('tcm-prompt',      fmt(stats.lastPrompt));
-    setText('tcm-completion',  fmt(stats.lastCompletion + stats.streamingCount));
-    setText('tcm-total',       fmt(lastTotal));
-    setText('tcm-tps',         stats.lastDuration > 0
-        ? Math.round((stats.lastCompletion || stats.streamingCount) / (stats.lastDuration / 1000)) + ' tok/s'
-        : '-');
-
-    // Cache
-    setText('tcm-ch-hit',      fmt(stats.lastCacheHit));
-    setText('tcm-ch-miss',     fmt(stats.lastCacheMiss));
-    setText('tcm-ch-rate',     lastCacheRate !== null ? lastCacheRate + '%' : '-');
-    setText('tcm-eff-score',   effScore);
-    setText('tcm-eff-label',   eff.text);
-    setEffColor(eff.color);
-
-    // Session
-    setText('tcm-ses-prompt',  fmt(stats.totalPrompt));
-    setText('tcm-ses-compl',   fmt(stats.totalCompletion + stats.streamingCount));
-    setText('tcm-ses-total',   fmt(sessionTotal));
-    setText('tcm-ses-req',     stats.requests);
-    setText('tcm-ses-avg',     fmt(avgTokensPerRequest()));
-    setText('tcm-ses-tps',     tps > 0 ? tps + ' tok/s' : '-');
-
-    // Cost
-    setText('tcm-cost',        fmtCost(stats.cost));
-    setText('tcm-cost-proj',   fmtCost(projectedCost(50)));
-    setText('tcm-model',       cfg.costModel);
-
-    // Cache rate color
-    const rateEl = $('tcm-ch-rate');
-    if (rateEl && lastCacheRate !== null) {
-        rateEl.style.color = lastCacheRate >= 50 ? '#4caf50' : lastCacheRate >= 20 ? '#ff9800' : '#f44336';
-    }
-
-    // Efficiency bar
-    const bar = $('tcm-eff-bar-fill');
-    if (bar) {
-        bar.style.width = effScore + '%';
-        bar.style.background = eff.color;
-    }
-
-    // Generating indicator
-    const dot = $('tcm-dot');
-    if (dot) {
-        dot.textContent = generating ? '🟢' : '⚪';
-        dot.title = generating ? `Generating (${stats.streamingCount} tokens, ${tps || '?'} tok/s)...` : 'Idle';
-    }
-
-    // Trend mini-chart
-    drawTrend();
-}
-
-function setText(id, val) {
-    const el = $(`#${id}`);
-    if (el) el.textContent = val;
-}
-
-function setEffColor(color) {
-    const scoreEl = $('tcm-eff-score');
-    const labelEl = $('tcm-eff-label');
-    if (scoreEl) scoreEl.style.color = color;
-    if (labelEl) labelEl.style.color = color;
-}
-
-// ── Mini Trend Chart (CSS-based bar chart) ─────────────────────────────────
-
-function drawTrend() {
-    const container = $('tcm-trend-bars');
-    if (!container || !cfg.showTrend) return;
-
-    const bars = container.querySelectorAll('.tcm-trend-bar');
-    const hItems = stats.history.slice(0, bars.length).reverse();
-
-    bars.forEach((bar, i) => {
-        const item = hItems[i];
-        if (item) {
-            const max = Math.max(item.prompt, item.completion, 1);
-            const pH = (item.prompt / max) * 100;
-            const cH = (item.completion / max) * 100;
-            bar.querySelector('.tcm-trend-p').style.height = pH + '%';
-            bar.querySelector('.tcm-trend-c').style.height = cH + '%';
-            bar.title = `Req #${stats.requests - hItems.length + i + 1}: P=${fmt(item.prompt)} C=${fmt(item.completion)} @ ${item.tps} tok/s`;
-            bar.style.opacity = '1';
-        } else {
-            bar.querySelector('.tcm-trend-p').style.height = '0%';
-            bar.querySelector('.tcm-trend-c').style.height = '0%';
-            bar.style.opacity = '0.4';
-        }
-    });
-}
-
-// ── Panel HTML ─────────────────────────────────────────────────────────────
-
-const PANEL_HTML = /* html */ `
-<div id="tcm-panel" class="tcm-panel${cfg.panelCollapsed ? ' tcm-collapsed' : ''}">
-  <div class="tcm-head">
-    <span class="tcm-head-left">
-      <span id="tcm-dot" class="tcm-dot" title="Idle">⚪</span>
-      <span class="tcm-title">🐋 Token Monitor</span>
-    </span>
-    <span class="tcm-head-btns">
-      <button class="tcm-btn" id="tcm-btn-toggle" title="Collapse">${cfg.panelCollapsed ? '➕' : '➖'}</button>
-      <button class="tcm-btn" id="tcm-btn-reset"  title="Reset all stats">↺</button>
-      <button class="tcm-btn" id="tcm-btn-close"  title="Close panel">✕</button>
-    </span>
-  </div>
-  <div class="tcm-body"${cfg.panelCollapsed ? ' style="display:none"' : ''}>
-    <!-- Last Request -->
-    <div class="tcm-section">
-      <div class="tcm-section-title">▼ Last Request</div>
-      <div class="tcm-row"><span>Prompt</span><span id="tcm-prompt">-</span></div>
-      <div class="tcm-row"><span>Completion</span><span id="tcm-completion">-</span></div>
-      <div class="tcm-row"><span>Total</span><span id="tcm-total">-</span></div>
-      <div class="tcm-row" id="tcm-tps-row"><span>Speed</span><span id="tcm-tps">-</span></div>
-    </div>
-
-    <!-- Cache Info -->
-    <div class="tcm-section" id="tcm-cache-section"${cfg.showCacheInfo ? '' : ' style="display:none"'}>
-      <div class="tcm-section-title">▼ Cache (DeepSeek)</div>
-      <div class="tcm-row"><span>Hit</span><span class="tcm-green" id="tcm-ch-hit">-</span></div>
-      <div class="tcm-row"><span>Miss</span><span class="tcm-red" id="tcm-ch-miss">-</span></div>
-      <div class="tcm-row"><span>Hit Rate</span><span id="tcm-ch-rate">-</span></div>
-      <div class="tcm-row" style="margin-top:4px">
-        <span>Efficiency</span>
-        <span><span id="tcm-eff-score" style="font-weight:700">0</span> <span id="tcm-eff-label" style="font-size:10px">-</span></span>
-      </div>
-      <div class="tcm-eff-bar"><div class="tcm-eff-bar-fill" id="tcm-eff-bar-fill"></div></div>
-    </div>
-
-    <!-- Session Stats -->
-    <div class="tcm-section" id="tcm-session-section"${cfg.showSession ? '' : ' style="display:none"'}>
-      <div class="tcm-section-title">▼ Session</div>
-      <div class="tcm-row"><span>Prompt</span><span id="tcm-ses-prompt">0</span></div>
-      <div class="tcm-row"><span>Completion</span><span id="tcm-ses-compl">0</span></div>
-      <div class="tcm-row"><span>Total</span><span id="tcm-ses-total">0</span></div>
-      <div class="tcm-row"><span>Requests</span><span id="tcm-ses-req">0</span></div>
-      <div class="tcm-row"><span>Avg/Req</span><span id="tcm-ses-avg">0</span></div>
-      <div class="tcm-row"><span>Avg Speed</span><span id="tcm-ses-tps">-</span></div>
-    </div>
-
-    <!-- Cost -->
-    <div class="tcm-section" id="tcm-cost-section"${cfg.showCost ? '' : ' style="display:none"'}>
-      <div class="tcm-section-title">▼ Cost · <span id="tcm-model">-</span></div>
-      <div class="tcm-row tcm-cost-row"><span>Session</span><span id="tcm-cost">$0.00000</span></div>
-      <div class="tcm-row tcm-cost-row"><span>Proj. +50 msg</span><span id="tcm-cost-proj">$0.00000</span></div>
-    </div>
-
-    <!-- Mini Trend -->
-    <div class="tcm-section" id="tcm-trend-section"${cfg.showTrend ? '' : ' style="display:none"'}>
-      <div class="tcm-section-title">▼ Trend (last ${MAX_HISTORY})</div>
-      <div class="tcm-trend-container">
-        <div class="tcm-trend-bars" id="tcm-trend-bars">
-          ${Array.from({length: MAX_HISTORY}, () => `
-            <div class="tcm-trend-bar">
-              <div class="tcm-trend-p" style="height:0%"></div>
-              <div class="tcm-trend-c" style="height:0%"></div>
-            </div>
-          `).join('')}
+function settings(){
+    const ov=document.createElement('div');ov.className='tcm-o';
+    ov.innerHTML=/*html*/`
+      <div class="tcm-set">
+        <h3>Token &amp; Cache Monitor</h3>
+        <label><input type="checkbox" id="tcs-b" ${cfg.showBadges?'checked':''}> 消息 token 徽章</label>
+        <label><input type="checkbox" id="tcs-c" ${cfg.showCache?'checked':''}> 缓存信息</label>
+        <label><input type="checkbox" id="tcs-s" ${cfg.showSession?'checked':''}> 会话统计</label>
+        <label><input type="checkbox" id="tcs-o" ${cfg.showCost?'checked':''}> 费用估算</label>
+        <label><input type="checkbox" id="tcs-t" ${cfg.showThroughput?'checked':''}> 吞吐量</label>
+        <label><input type="checkbox" id="tcs-r" ${cfg.showTrend?'checked':''}> 趋势图</label>
+        <label>计费: <select id="tcs-m">
+          <option value="auto" ${cfg.costModel==='auto'?'selected':''}>自动检测</option>
+          <option value="deepseek-v4-pro" ${cfg.costModel==='deepseek-v4-pro'?'selected':''}>DeepSeek V4 Pro</option>
+          <option value="deepseek-v4-flash" ${cfg.costModel==='deepseek-v4-flash'?'selected':''}>DeepSeek V4 Flash</option>
+          <option value="deepseek-v3" ${cfg.costModel==='deepseek-v3'?'selected':''}>DeepSeek V3</option>
+          <option value="deepseek-r1" ${cfg.costModel==='deepseek-r1'?'selected':''}>DeepSeek R1</option>
+          <option value="claude-sonnet-4" ${cfg.costModel==='claude-sonnet-4'?'selected':''}>Claude Sonnet 4</option>
+          <option value="gpt-4o" ${cfg.costModel==='gpt-4o'?'selected':''}>GPT-4o</option>
+          <option value="custom" ${cfg.costModel==='custom'?'selected':''}>自定义</option>
+        </select></label>
+        <div id="tcs-x" style="display:${cfg.costModel==='custom'?'block':'none'}">
+          <label>命中 ¥/M: <input type="number" id="tcs-h" value="${cfg.customPrice.hit}" step="0.001"></label>
+          <label>未命中 ¥/M: <input type="number" id="tcs-m2" value="${cfg.customPrice.miss}" step="0.01"></label>
+          <label>输出 ¥/M: <input type="number" id="tcs-o2" value="${cfg.customPrice.output}" step="0.01"></label>
         </div>
-        <div class="tcm-trend-legend">
-          <span><span class="tcm-legend-p"></span>Prompt</span>
-          <span><span class="tcm-legend-c"></span>Completion</span>
-        </div>
-      </div>
-    </div>
-  </div>
-</div>`;
-
-// ── Panel lifecycle ────────────────────────────────────────────────────────
-
-function createUI() {
-    if (root) root.remove();
-    const wrapper = document.createElement('div');
-    wrapper.innerHTML = PANEL_HTML;
-    root = wrapper.firstElementChild;
-    document.body.appendChild(root);
-    position();
-    bindUI();
-    render();
-}
-
-function position() {
-    if (!root) return;
-    if (cfg.panelPosition.x !== null) {
-        root.style.right = 'auto';
-        root.style.bottom = 'auto';
-        root.style.left = cfg.panelPosition.x + 'px';
-        root.style.top  = cfg.panelPosition.y + 'px';
-    } else {
-        root.style.left = 'auto';
-        root.style.top  = 'auto';
-        root.style.right = '12px';
-        root.style.bottom = '90px';
-    }
-}
-
-function bindUI() {
-    $('#tcm-btn-toggle')?.addEventListener('click', toggle);
-    $('#tcm-btn-reset')?.addEventListener('click', () => { resetStats(); refresh(); });
-    $('#tcm-btn-close')?.addEventListener('click', () => {
-        root.style.display = root.style.display === 'none' ? '' : 'none';
+        <div class="tcm-sb"><button id="tcs-ok">应用</button><button id="tcs-no">取消</button></div>
+      </div>`;
+    document.body.appendChild(ov);
+    ov.querySelector('#tcs-m').addEventListener('change',function(){ov.querySelector('#tcs-x').style.display=this.value==='custom'?'block':'none';});
+    ov.addEventListener('click',e=>{if(e.target===ov)ov.remove();});
+    ov.querySelector('#tcs-no').addEventListener('click',()=>ov.remove());
+    ov.querySelector('#tcs-ok').addEventListener('click',()=>{
+        cfg.showBadges=ov.querySelector('#tcs-b').checked;cfg.showCache=ov.querySelector('#tcs-c').checked;
+        cfg.showSession=ov.querySelector('#tcs-s').checked;cfg.showCost=ov.querySelector('#tcs-o').checked;
+        cfg.showThroughput=ov.querySelector('#tcs-t').checked;cfg.showTrend=ov.querySelector('#tcs-r').checked;
+        cfg.costModel=ov.querySelector('#tcs-m').value;
+        if(cfg.costModel==='custom'){cfg.customPrice.hit=+ov.querySelector('#tcs-h').value||0;cfg.customPrice.miss=+ov.querySelector('#tcs-m2').value||0;cfg.customPrice.output=+ov.querySelector('#tcs-o2').value||0;}
+        saveCfg();ov.remove();rebuild();
     });
-
-    // Dragging
-    const head = root.querySelector('.tcm-head');
-    head?.addEventListener('mousedown', e => {
-        if (e.target.tagName === 'BUTTON') return;
-        dragging = true;
-        const r = root.getBoundingClientRect();
-        dX = e.clientX - r.left;
-        dY = e.clientY - r.top;
-        root.style.cursor = 'grabbing';
-        e.preventDefault();
-    });
-    document.addEventListener('mousemove', e => {
-        if (!dragging) return;
-        cfg.panelPosition.x = e.clientX - dX;
-        cfg.panelPosition.y = e.clientY - dY;
-        root.style.right = 'auto';
-        root.style.bottom = 'auto';
-        root.style.left = cfg.panelPosition.x + 'px';
-        root.style.top  = cfg.panelPosition.y + 'px';
-    });
-    document.addEventListener('mouseup', () => {
-        if (!dragging) return;
-        dragging = false;
-        root.style.cursor = '';
-        saveCfg();
-    });
-
-    // Double-click header to toggle
-    head?.addEventListener('dblclick', toggle);
-}
-
-function toggle() {
-    cfg.panelCollapsed = !cfg.panelCollapsed;
-    saveCfg();
-    const body = root.querySelector('.tcm-body');
-    const btn  = $('#tcm-btn-toggle');
-    if (cfg.panelCollapsed) {
-        body.style.display = 'none';
-        if (btn) btn.textContent = '➕';
-        root.classList.add('tcm-collapsed');
-    } else {
-        body.style.display = '';
-        if (btn) btn.textContent = '➖';
-        root.classList.remove('tcm-collapsed');
-    }
-}
-
-function resetStats() {
-    stats.lastPrompt      = 0;
-    stats.lastCompletion  = 0;
-    stats.lastCacheHit    = 0;
-    stats.lastCacheMiss   = 0;
-    stats.lastTime        = 0;
-    stats.lastDuration    = 0;
-    stats.totalPrompt     = 0;
-    stats.totalCompletion = 0;
-    stats.totalCacheHit   = 0;
-    stats.totalCacheMiss  = 0;
-    stats.requests        = 0;
-    stats.cost            = 0;
-    stats.totalDuration   = 0;
-    stats.streamingCount  = 0;
-    stats.genStartTime    = 0;
-    stats.history         = [];
-    clearSession();
-}
-
-function rebuild() {
-    if (root) {
-        const pos = cfg.panelPosition;
-        const collapsed = cfg.panelCollapsed;
-        root.remove();
-        root = null;
-        createUI();
-        if (collapsed) toggle();
-        if (pos.x !== null) {
-            root.style.left = pos.x + 'px';
-            root.style.top  = pos.y + 'px';
-            root.style.right = 'auto';
-            root.style.bottom = 'auto';
-        }
-    }
-}
-
-// ── Settings overlay ───────────────────────────────────────────────────────
-
-function openSettings() {
-    const overlay = document.createElement('div');
-    overlay.className = 'tcm-overlay';
-    overlay.innerHTML = /* html */ `
-    <div class="tcm-settings-box">
-      <h3>🐋 Token Monitor Settings</h3>
-      <label><input type="checkbox" id="tcm-set-cache" ${cfg.showCacheInfo ? 'checked' : ''}> Show cache section</label>
-      <label><input type="checkbox" id="tcm-set-session" ${cfg.showSession ? 'checked' : ''}> Show session stats</label>
-      <label><input type="checkbox" id="tcm-set-cost" ${cfg.showCost ? 'checked' : ''}> Show cost estimate</label>
-      <label><input type="checkbox" id="tcm-set-tput" ${cfg.showThroughput ? 'checked' : ''}> Show throughput (tok/s)</label>
-      <label><input type="checkbox" id="tcm-set-trend" ${cfg.showTrend ? 'checked' : ''}> Show mini trend chart</label>
-      <label>Model: <select id="tcm-set-model">
-        <option value="deepseek-v4-pro" ${cfg.costModel === 'deepseek-v4-pro' ? 'selected' : ''}>DeepSeek V4 Pro</option>
-        <option value="deepseek-v4-flash" ${cfg.costModel === 'deepseek-v4-flash' ? 'selected' : ''}>DeepSeek V4 Flash</option>
-        <option value="deepseek-v3" ${cfg.costModel === 'deepseek-v3' ? 'selected' : ''}>DeepSeek V3</option>
-        <option value="gpt-4o" ${cfg.costModel === 'gpt-4o' ? 'selected' : ''}>GPT-4o</option>
-        <option value="claude-3.5-sonnet" ${cfg.costModel === 'claude-3.5-sonnet' ? 'selected' : ''}>Claude 3.5 Sonnet</option>
-        <option value="custom" ${cfg.costModel === 'custom' ? 'selected' : ''}>Custom</option>
-      </select></label>
-      <div id="tcm-custom-block" style="display:${cfg.costModel === 'custom' ? 'block' : 'none'}">
-        <label>Input $/M: <input type="number" id="tcm-set-in"  value="${cfg.customPricing.input}" step="0.0001" min="0"></label>
-        <label>Cache $/M: <input type="number" id="tcm-set-ch"  value="${cfg.customPricing.cacheHit}" step="0.0001" min="0"></label>
-        <label>Output $/M: <input type="number" id="tcm-set-out" value="${cfg.customPricing.output}" step="0.0001" min="0"></label>
-      </div>
-      <div class="tcm-settings-actions">
-        <button id="tcm-set-apply">Apply</button>
-        <button id="tcm-set-dismiss">Close</button>
-      </div>
-    </div>`;
-
-    document.body.appendChild(overlay);
-
-    overlay.querySelector('#tcm-set-model').addEventListener('change', function () {
-        overlay.querySelector('#tcm-custom-block').style.display =
-            this.value === 'custom' ? 'block' : 'none';
-    });
-
-    overlay.addEventListener('click', e => {
-        if (e.target === overlay) overlay.remove();
-    });
-    overlay.querySelector('#tcm-set-dismiss').addEventListener('click', () => overlay.remove());
-    overlay.querySelector('#tcm-set-apply').addEventListener('click', () => {
-        cfg.showCacheInfo  = overlay.querySelector('#tcm-set-cache').checked;
-        cfg.showSession    = overlay.querySelector('#tcm-set-session').checked;
-        cfg.showCost       = overlay.querySelector('#tcm-set-cost').checked;
-        cfg.showThroughput = overlay.querySelector('#tcm-set-tput').checked;
-        cfg.showTrend      = overlay.querySelector('#tcm-set-trend').checked;
-        cfg.costModel      = overlay.querySelector('#tcm-set-model').value;
-        if (cfg.costModel === 'custom') {
-            cfg.customPricing.input    = +overlay.querySelector('#tcm-set-in').value || 0;
-            cfg.customPricing.cacheHit = +overlay.querySelector('#tcm-set-ch').value || 0;
-            cfg.customPricing.output   = +overlay.querySelector('#tcm-set-out').value || 0;
-        }
-        saveCfg();
-        overlay.remove();
-        rebuild();
-    });
-}
-
-// ── Settings button in panel header ────────────────────────────────────────
-
-function addSettingsButton() {
-    const btn = document.createElement('button');
-    btn.className = 'tcm-btn';
-    btn.id = 'tcm-btn-settings';
-    btn.textContent = '⚙';
-    btn.title = 'Settings';
-    btn.addEventListener('click', openSettings);
-    const headBtns = root.querySelector('.tcm-head-btns');
-    if (headBtns) headBtns.insertBefore(btn, headBtns.firstChild);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// STscript command registration (if slash-commands are supported)
+// STscript
 // ═══════════════════════════════════════════════════════════════════════════
 
-function registerSlashCommands() {
-    try {
-        const ctx = getContext();
-        if (typeof ctx.registerSlashCommand !== 'function') return;
-
-        ctx.registerSlashCommand('token-stats', () => {
-            const eff = cacheEfficiencyScore();
-            const el = effLabel(eff);
-            const tps = avgThroughput();
-            const msg = [
-                `🐋 **Token Monitor Stats**`,
-                ``,
-                `**Session:**`,
-                `• Requests: ${stats.requests}`,
-                `• Prompt tokens: ${fmt(stats.totalPrompt)}`,
-                `• Completion tokens: ${fmt(stats.totalCompletion)}`,
-                `• Total tokens: ${fmt(stats.totalPrompt + stats.totalCompletion)}`,
-                `• Avg per request: ${fmt(avgTokensPerRequest())}`,
-                ``,
-                `**Cache (DeepSeek):**`,
-                `• Hit: ${fmt(stats.totalCacheHit)} | Miss: ${fmt(stats.totalCacheMiss)}`,
-                `• Efficiency: ${eff}% (${el.text})`,
-                ``,
-                `**Performance:**`,
-                `• Avg throughput: ${tps} tok/s`,
-                `• Total generation time: ${(stats.totalDuration / 1000).toFixed(1)}s`,
-                ``,
-                `**Cost:**`,
-                `• Session: ${fmtCost(stats.cost)}`,
-                `• Projected (+50): ${fmtCost(projectedCost(50))}`,
-            ].join('\n');
-
-            ctx.sendSystemMessage?.(msg) || console.log(msg);
-        }, { description: 'Show token statistics summary' });
-
-        ctx.registerSlashCommand('token-reset', () => {
-            resetStats();
-            refresh();
-            ctx.sendSystemMessage?.('✅ Token stats reset.') || console.log('Token stats reset.');
-        }, { description: 'Reset all token statistics' });
-
-    } catch { /* STscript not available — non-critical */ }
+function regCmd(){
+    try{const ctx=getContext();if(typeof ctx.registerSlashCommand!=='function')return;
+        ctx.registerSlashCommand('token-stats',()=>{const e=cScore(),l=sLabel(e),t=avgT();
+            const m=['**Token Monitor**',`请求:${S.requests} 均/次:${fmt(avgR())}`,
+                `Prompt:${fmt(S.totalPrompt)} Completion:${fmt(S.totalCompletion)}`,
+                `缓存:✓${fmt(S.totalCacheHit)} ✗${fmt(S.totalCacheMiss)} 效率:${e}%(${l.t})`,
+                `吞吐:${t} tok/s 费用:${fc(S.cost)} 预估+50:${fc(projCost(50))}`].join('\n');
+            try{ctx.sendSystemMessage?.(m);}catch{console.log(m);}},{description:'显示 token 统计'});
+        ctx.registerSlashCommand('token-reset',()=>{reset();try{ctx.sendSystemMessage?.('✅ 已重置');}catch{}},{description:'重置当前对话统计'});
+    }catch{}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Init
 // ═══════════════════════════════════════════════════════════════════════════
 
-function refresh() { render(); }
+function refresh(){render();}
 
-function init() {
-    loadCfg();
-    loadSession();
-    patchFetch();
-    hookEvents();
-    createUI();
-    addSettingsButton();
-    registerSlashCommands();
-    console.log('[TokenCacheMonitor v2] 🐋 Ready — CodeWhale-style token tracking active. '
-        + `Model: ${cfg.costModel}, Cache: ${cfg.showCacheInfo ? 'ON' : 'OFF'}, `
-        + `Session persisted: ${stats.requests > 0 ? stats.requests + ' reqs' : 'fresh'}`);
+function init(){
+    loadCfg();_chatId=chatId();S=load(_chatId);
+    eventSource.on(event_types.GENERATION_STARTED,onGenStart);
+    eventSource.on(event_types.STREAM_TOKEN_RECEIVED,onStreamToken);
+    eventSource.on(event_types.GENERATION_ENDED,onGenEnd);
+    eventSource.on(event_types.GENERATION_STOPPED,onGenStop);
+    eventSource.on(event_types.CHAT_CHANGED,onChatChange);
+    build();startBadgeObs();regCmd();
+    if(!cfg.panelVisible){root.style.display='none';showToggle();}
 }
 
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-} else {
-    init();
-}
+jQuery(()=>{init();});
 
-// Export for console debugging & STscript
-window.TokenCacheMonitor = {
-    stats,
-    cfg,
-    reset: resetStats,
-    refresh,
-    getReport: () => ({
-        sessionRequests: stats.requests,
-        totalTokens: stats.totalPrompt + stats.totalCompletion,
-        totalCost: stats.cost,
-        cacheEfficiency: cacheEfficiencyScore(),
-        avgThroughput: avgThroughput(),
-    }),
-};
+window.TokenCacheMonitor={stats:S,cfg,reset,refresh};
