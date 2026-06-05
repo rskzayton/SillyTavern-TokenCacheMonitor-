@@ -25,7 +25,19 @@
 
 ## 📦 安装
 
-### 方式一：复制文件夹（推荐）
+### 方式一：GitHub URL 安装（推荐）
+
+1. 打开 SillyTavern，进入 **Extensions** 面板。
+2. 点击 **Install Extension**，粘贴以下 URL：
+   ```
+   https://github.com/rskzayton/SillyTavern-TokenCacheMonitor-
+   ```
+3. 在扩展列表中启用 **"CodeWhale 风格 Token 统计与分析"**。
+4. 刷新页面，右下角即可看到 🐋 浮动面板。
+
+> 自动从 GitHub 拉取最新版本，后续更新只需在 ST 中点击 Update 即可。
+
+### 方式二：复制文件夹
 
 1. 将整个 `SillyTavern-TokenCacheMonitor` 文件夹复制到：
    ```
@@ -35,12 +47,6 @@
 2. 重启 SillyTavern（或刷新页面）。
 
 3. 在 Extensions 面板中启用 **"CodeWhale 风格 Token 统计与分析"**。
-
-### 方式二：GitHub URL 安装
-
-1. 将本文件夹上传到 GitHub 仓库。
-
-2. 在 SillyTavern → Extensions → Install Extension 中输入仓库 URL。
 
 ### 可选：服务端补丁（DeepSeek 缓存字段透传）
 
